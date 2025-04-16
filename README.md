@@ -4,12 +4,11 @@
 This project implements a deep learning system to predict neural responses to visual stimuli using a ResNet-based encoder. The system takes images as input and predicts how different neurons in the visual cortex will respond to these images.
 
 ## Team Members
-[Add your team members' names here]
+Justin Bonner, Ethan Tieu, Gabriel Huang, Devon Mason
 
 ## Course Information
 - Course: CSC550
-- Institution: [Your University]
-- Semester: [Current Semester]
+- Institution: University of Miami
 
 ## Project Structure
 ```
@@ -23,16 +22,6 @@ This project implements a deep learning system to predict neural responses to vi
 └── README.md           # This file
 ```
 
-## Dependencies
-All required Python packages are listed in `requirements.txt`. The main dependencies include:
-- PyTorch
-- torchvision
-- NumPy
-- scikit-learn
-- matplotlib
-- Pillow
-- transformers
-
 ## Installation
 1. Clone the repository
 2. Create a virtual environment (recommended):
@@ -43,14 +32,6 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 3. Install dependencies from requirements.txt:
 ```bash
 pip install -r requirements.txt
-```
-
-## Usage
-1. Place your training images in `images/train/`
-2. Place your test images in `images/test/`
-3. Run the main script:
-```bash
-python ResNet.py
 ```
 
 ## Model Architecture
