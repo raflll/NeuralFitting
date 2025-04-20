@@ -2,14 +2,15 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import KFold
-from sklearn.metrics import r2_score
-from PIL import Image
 from torchvision import transforms
 from torchvision.models import resnet50, ResNet50_Weights
+from sklearn.linear_model import Ridge
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
 import matplotlib.pyplot as plt
+from PIL import Image
+from scipy.stats import pearsonr
 
 # Set random seed for reproducibility
 torch.manual_seed(42)
@@ -21,13 +22,8 @@ TEST_IMAGES_DIR = 'images/test'
 TRAIN_RESPONSES_PATH = 'neural_responses_train.npy'
 
 # Parameters
-NUM_NEURONS = 5
-BATCH_SIZE = 16
-NUM_EPOCHS = 100
-LEARNING_RATE = 1e-3
-NUM_FOLDS = 5
+BATCH_SIZE = 10
 IMAGE_SIZE = 224
-WEIGHT_DECAY = 1e-5
 
 # Load neural responses
 train_responses = np.load(TRAIN_RESPONSES_PATH)
@@ -69,297 +65,157 @@ transform = transforms.Compose([
                          std=[0.229, 0.224, 0.225])
 ])
 
-# ResNet-based neural response predictor
-class ResNetEncoder(nn.Module):
-    def __init__(self, num_neurons=5):
-        super(ResNetEncoder, self).__init__()
-        
-        # Load pre-trained ResNet
-        self.resnet = resnet50(weights=ResNet50_Weights.DEFAULT)
-        
-        # Remove the final fully connected layer
-        self.features = nn.Sequential(*list(self.resnet.children())[:-2])
-        
-        # Freeze the backbone parameters
-        for param in self.features.parameters():
-            param.requires_grad = False
-        
-        # Global pooling to reduce spatial dimensions
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        
-        # Regression head for each neuron
-        self.regression_head = nn.Sequential(
-            nn.Linear(2048, 512),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(512, 128),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, num_neurons)
-        )
-        
-    def forward(self, x):
-        # Get features from ResNet
-        features = self.features(x)
-        
-        # Apply global average pooling
-        pooled = self.pool(features).squeeze(-1).squeeze(-1)
-        
-        # Predict responses
-        responses = self.regression_head(pooled)
-        
-        return responses
-
-# Cross-validation and training
-def train_and_validate():
-    # Prepare datasets
-    full_train_dataset = NeuralResponseDataset(
+def extract_features():
+    # Load pre-trained ResNet50
+    model = resnet50(weights=ResNet50_Weights.DEFAULT)
+    model = nn.Sequential(*list(model.children())[:-2])  # Remove last two layers
+    model.eval()
+    
+    # Create datasets
+    train_dataset = NeuralResponseDataset(
         image_dir=TRAIN_IMAGES_DIR,
         responses=train_responses,
         transform=transform
     )
     
-    # Initialize k-fold cross-validation
-    kfold = KFold(n_splits=NUM_FOLDS, shuffle=True, random_state=42)
-    
-    # Lists to store results
-    fold_r2_scores = []
-    
-    for fold, (train_idx, val_idx) in enumerate(kfold.split(full_train_dataset)):
-        print(f"Fold {fold+1}/{NUM_FOLDS}")
-        
-        # Create data loaders for this fold
-        train_subsampler = torch.utils.data.SubsetRandomSampler(train_idx)
-        val_subsampler = torch.utils.data.SubsetRandomSampler(val_idx)
-        
-        train_loader = DataLoader(
-            full_train_dataset, 
-            batch_size=BATCH_SIZE, 
-            sampler=train_subsampler
-        )
-        
-        val_loader = DataLoader(
-            full_train_dataset,
-            batch_size=BATCH_SIZE,
-            sampler=val_subsampler
-        )
-        
-        # Initialize model, loss function, and optimizer
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        model = ResNetEncoder(num_neurons=NUM_NEURONS).to(device)
-        criterion = nn.MSELoss()
-        optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-        
-        # Learning rate scheduler
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='max', factor=0.5, patience=5, verbose=True
-        )
-        
-        # Training loop
-        best_r2 = -float('inf')
-        best_model_state = None
-        
-        for epoch in range(NUM_EPOCHS):
-            model.train()
-            train_loss = 0.0
-            
-            for images, responses in train_loader:
-                images = images.to(device)
-                responses = responses.to(device).float()
-                
-                # Forward pass
-                outputs = model(images)
-                loss = criterion(outputs, responses)
-                
-                # Backward pass and optimize
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                
-                train_loss += loss.item()
-            
-            # Validation
-            if (epoch + 1) % 5 == 0 or epoch == NUM_EPOCHS - 1:
-                model.eval()
-                all_preds = []
-                all_targets = []
-                val_loss = 0.0
-                
-                with torch.no_grad():
-                    for images, responses in val_loader:
-                        images = images.to(device)
-                        responses = responses.to(device).float()
-                        
-                        outputs = model(images)
-                        loss = criterion(outputs, responses)
-                        val_loss += loss.item()
-                        
-                        all_preds.append(outputs.cpu().numpy())
-                        all_targets.append(responses.cpu().numpy())
-                
-                # Calculate R² score
-                all_preds = np.vstack(all_preds)
-                all_targets = np.vstack(all_targets)
-                r2 = r2_score(all_targets, all_preds)
-                
-                # Update learning rate based on validation R²
-                scheduler.step(r2)
-                
-                # Save best model
-                if r2 > best_r2:
-                    best_r2 = r2
-                    best_model_state = model.state_dict().copy()
-                
-                print(f"Epoch {epoch+1}/{NUM_EPOCHS}, Train Loss: {train_loss/len(train_loader):.4f}, "
-                      f"Val Loss: {val_loss/len(val_loader):.4f}, R² Score: {r2:.4f}")
-        
-        # Load best model for final evaluation
-        model.load_state_dict(best_model_state)
-        
-        # Calculate final validation R² for this fold
-        model.eval()
-        all_preds = []
-        all_targets = []
-        
-        with torch.no_grad():
-            for images, responses in val_loader:
-                images = images.to(device)
-                responses = responses.float()
-                
-                outputs = model(images)
-                
-                all_preds.append(outputs.cpu().numpy())
-                all_targets.append(responses.numpy())
-        
-        all_preds = np.vstack(all_preds)
-        all_targets = np.vstack(all_targets)
-        
-        # Calculate R² for each neuron
-        neuron_r2 = []
-        for n in range(NUM_NEURONS):
-            r2 = r2_score(all_targets[:, n], all_preds[:, n])
-            neuron_r2.append(r2)
-            print(f"Fold {fold+1}, Neuron {n+1} R²: {r2:.4f}")
-        
-        fold_r2 = np.mean(neuron_r2)
-        fold_r2_scores.append(fold_r2)
-        print(f"Fold {fold+1} Mean R²: {fold_r2:.4f}")
-        
-        # Save the model
-        torch.save(model.state_dict(), f'resnet_encoder_fold_{fold+1}.pth')
-
-    # Print average R² across all folds
-    mean_r2 = np.mean(fold_r2_scores)
-    print(f"Average R² across all folds: {mean_r2:.4f}")
-    
-    return fold_r2_scores
-
-# Generate predictions for test set
-def generate_test_predictions(best_fold):
-    # Load test dataset
     test_dataset = NeuralResponseDataset(
         image_dir=TEST_IMAGES_DIR,
         transform=transform,
         is_test=True
     )
     
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=False
-    )
+    # Create data loaders
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
     
-    # Load the best model
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = ResNetEncoder(num_neurons=NUM_NEURONS).to(device)
-    model.load_state_dict(torch.load(f'resnet_encoder_fold_{best_fold}.pth'))
-    model.eval()
+    model = model.to(device)
     
-    # Generate predictions
-    all_preds = []
-    all_filenames = []
+    # Extract features for training set
+    train_features = []
+    train_targets = []
+    
+    with torch.no_grad():
+        for images, responses in train_loader:
+            images = images.to(device)
+            features = model(images)
+            # Global average pooling
+            features = torch.mean(features, dim=[2, 3])
+            train_features.append(features.cpu().numpy())
+            train_targets.append(responses.numpy())
+    
+    train_features = np.vstack(train_features)
+    train_targets = np.vstack(train_targets)
+    
+    # Extract features for test set
+    test_features = []
+    test_filenames = []
     
     with torch.no_grad():
         for images, filenames in test_loader:
             images = images.to(device)
-            outputs = model(images)
-            
-            all_preds.append(outputs.cpu().numpy())
-            all_filenames.extend(filenames)
+            features = model(images)
+            # Global average pooling
+            features = torch.mean(features, dim=[2, 3])
+            test_features.append(features.cpu().numpy())
+            test_filenames.extend(filenames)
     
-    # Combine predictions
-    all_preds = np.vstack(all_preds)
+    test_features = np.vstack(test_features)
+    
+    return train_features, train_targets, test_features, test_filenames
+
+def train_ridge_models(train_features, train_targets):
+    # Train separate Ridge models for each neuron
+    ridge_models = []
+    correlation_scores = []
+    
+    for n in range(train_targets.shape[1]):
+        print(f"Training Ridge model for Neuron {n+1}")
+        
+        # Try different alpha values
+        best_alpha = 1.0
+        best_score = -float('inf')
+        
+        for alpha in [0.001, 0.01, 0.1, 1.0, 10.0, 50.0, 100.0]:
+            # Define pipeline
+            pipeline = Pipeline([
+                ('scaler', StandardScaler()),
+                ('ridge', Ridge(alpha=alpha))
+            ])
+            
+            # Fit model and calculate Pearson correlation
+            pipeline.fit(train_features, train_targets[:, n])
+            predictions = pipeline.predict(train_features)
+            correlation, _ = pearsonr(predictions, train_targets[:, n])
+            
+            print(f"  Alpha={alpha}, Pearson r: {correlation:.4f}")
+            
+            if correlation > best_score:
+                best_score = correlation
+                best_alpha = alpha
+        
+        # Train final model with best alpha
+        final_pipeline = Pipeline([
+            ('scaler', StandardScaler()),
+            ('ridge', Ridge(alpha=best_alpha))
+        ])
+        final_pipeline.fit(train_features, train_targets[:, n])
+        
+        ridge_models.append(final_pipeline)
+        correlation_scores.append(best_score)
+        
+        print(f"Neuron {n+1}: Best alpha={best_alpha}, Best Pearson r: {best_score:.4f}")
+    
+    return ridge_models, correlation_scores
+
+def generate_predictions(ridge_models, test_features):
+    # Generate predictions for each neuron
+    test_preds = np.zeros((test_features.shape[0], len(ridge_models)))
+    
+    for n, model in enumerate(ridge_models):
+        test_preds[:, n] = model.predict(test_features)
+    
+    return test_preds
+
+if __name__ == "__main__":
+    # Extract features
+    print("Extracting features...")
+    train_features, train_targets, test_features, test_filenames = extract_features()
+    
+    # Train Ridge models
+    print("\nTraining Ridge models...")
+    ridge_models, correlation_scores = train_ridge_models(train_features, train_targets)
+    
+    # Generate predictions
+    print("\nGenerating predictions...")
+    test_preds = generate_predictions(ridge_models, test_features)
     
     # Save predictions
-    np.save('neural_responses_test_pred.npy', all_preds)
+    np.save('neural_responses_test_pred.npy', test_preds)
     
     # Save filenames for reference
     with open('test_image_order.txt', 'w') as f:
-        for filename in all_filenames:
+        for filename in test_filenames:
             f.write(f"{filename}\n")
     
-    print(f"Generated predictions for {len(all_filenames)} test images")
-    return all_preds
-
-if __name__ == "__main__":
-    # Train and validate the ResNet model
-    fold_r2_scores = train_and_validate()
+    # Visualize predictions
+    plt.figure(figsize=(15, 5))
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']  # Blue, Orange, Green, Red, Purple
     
-    # Find the best fold
-    best_fold = np.argmax(fold_r2_scores) + 1
-    print(f"Best fold: {best_fold} with R² = {fold_r2_scores[best_fold-1]:.4f}")
-    
-    # Generate test predictions using the best fold
-    test_preds = generate_test_predictions(best_fold)
-    
-    # Enhanced visualizations
-    plt.figure(figsize=(15, 10))
-    
-    # 1. Cross-Validation Performance Plot
-    plt.subplot(2, 1, 1)
-    plt.bar(range(1, len(fold_r2_scores) + 1), fold_r2_scores, color='blue')
-    plt.axhline(y=np.mean(fold_r2_scores), color='r', linestyle='--', label='Mean R²')
-    plt.xlabel('Fold Number')
-    plt.ylabel('R² Score')
-    plt.title('ResNet Model Cross-Validation Performance')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    
-    # Add value labels on top of bars
-    for i, score in enumerate(fold_r2_scores):
-        plt.text(i + 1, score, f'{score:.4f}', ha='center', va='bottom')
-    
-    # 2. Neural Response Predictions
-    plt.subplot(2, 1, 2)
     for i in range(5):  # Show first 5 test samples
-        plt.plot(range(NUM_NEURONS), test_preds[i], 
-                marker='o', label=f'Test Image {i+1}')
-    
-    plt.xlabel('Neuron Index (1 to 5)')
-    plt.ylabel('Predicted Neural Response')
-    plt.title('ResNet Model: Predicted Neural Responses for Test Images')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    
-    # Add explanation text
-    plt.figtext(0.5, 0.01, 
-                "Top: Cross-validation performance across folds. Higher R² scores indicate better predictions.\n"
-                "Bottom: Predicted neural responses for 5 test images. Each line shows how different neurons respond to the same image.",
-                ha='center', fontsize=10, style='italic')
+        plt.subplot(1, 5, i+1)
+        bars = plt.bar(range(test_preds.shape[1]), test_preds[i], color=colors)
+        plt.title(f'Image {i+1}')
+        plt.xlabel('Neuron')
+        plt.ylabel('Response')
+        plt.xticks(range(test_preds.shape[1]), [f'{j+1}' for j in range(test_preds.shape[1])])
+        plt.ylim(-1, 1)
+        plt.grid(True, alpha=0.3)
     
     plt.tight_layout()
-    plt.savefig('resnet_model_performance.png')
+    plt.savefig('test_predictions_samples.png')
     plt.show()
     
-    # Print detailed explanation
-    print("\nVisualization Explanation:")
-    print("1. Cross-Validation Performance Plot (Top):")
-    print("   - Shows the R² score for each fold in cross-validation")
-    print("   - The red dashed line shows the mean R² score across all folds")
-    print("   - Higher R² scores (closer to 1) indicate better predictions")
-    print("\n2. Neural Response Predictions (Bottom):")
-    print("   - Shows predicted responses for 5 different test images")
-    print("   - Each line represents one test image")
-    print("   - X-axis shows the 5 different neurons being predicted")
-    print("   - Y-axis shows the predicted response strength for each neuron")
-    print("   - This helps visualize how different images activate different neurons")
+    # Print average Pearson correlation across neurons
+    mean_correlation = np.mean(correlation_scores)
+    print(f"\nAverage Pearson correlation across neurons: {mean_correlation:.4f}")
